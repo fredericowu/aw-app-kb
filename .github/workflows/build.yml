@@ -65,7 +65,7 @@ jobs:
         # infer psycopg3's generically-typed Connection through this
         # repo's lazy-import + module-global-Optional pattern — verified
         # false positive on every flagged line, see the pilot card report).
-        run: pylint kb_app --disable=all --enable=E --disable=E0401,E1101
+        run: python3 -m pylint kb_app --disable=all --enable=E --disable=E0401,E1101
 
   frontend:
     runs-on: [self-hosted, aw-baremetal]

@@ -48,7 +48,11 @@ TOOLS_SCHEMA = [
             "Search the project knowledge base for relevant documentation. "
             "Returns matching documents from the indexed knowledge base repositories. "
             "Use this when you need information about platform architecture, APIs, "
-            "configuration, deployment, or development workflows."
+            "configuration, deployment, or development workflows. Results are "
+            "re-ranked: curated docs up, the deactivated monolith and old docs "
+            "down, and Kanban cards (notion/kanban/) are EXCLUDED by default. "
+            "Pass include_cards=true to search incident history, past "
+            "decisions and task discussion that live only in cards."
         ),
         "inputSchema": {
             "type": "object",
@@ -61,6 +65,16 @@ TOOLS_SCHEMA = [
                     "type": "integer",
                     "description": "Number of results to return (default: 5)",
                     "default": 5,
+                },
+                "include_cards": {
+                    "type": "boolean",
+                    "description": (
+                        "Include Kanban cards (notion/kanban/) in the results, "
+                        "at full score. Default false: cards are hidden because "
+                        "they crowd out docs. Use true for incident history or "
+                        "'who decided X' questions."
+                    ),
+                    "default": False,
                 },
             },
             "required": ["query"],
@@ -265,7 +279,8 @@ def _force_scope(path: str, kb_index) -> str:
     return f"{root}/{path}"
 
 
-def _search_knowledge_base(query: str, n_results: int = 5, kb_index=None) -> dict:
+def _search_knowledge_base(query: str, n_results: int = 5, kb_index=None,
+                           include_cards: bool = False) -> dict:
     if not query:
         return _tool_result("Please provide a search query.", is_error=True)
 
@@ -278,13 +293,17 @@ def _search_knowledge_base(query: str, n_results: int = 5, kb_index=None) -> dic
         )
 
     allowed = _scope(kb_index)
+    # A profile scoped to the kanban index is asking for cards by definition.
+    include_cards = bool(include_cards) or "kanban" in (allowed or ())
     if allowed:
-        candidates = _kb.search(query, n_results=min(_SCOPED_OVERFETCH, total))
-        results = [r for r in candidates
+        found = _kb.search_ranked(query, n_results=min(_SCOPED_OVERFETCH, total),
+                                  include_cards=include_cards, pool=200)
+        results = [r for r in found["results"]
                    if r["metadata"].get("repo") in allowed][:n_results]
     else:
         n_results = min(n_results, total)
-        results = _kb.search(query, n_results=n_results)
+        found = _kb.search_ranked(query, n_results=n_results, include_cards=include_cards)
+        results = found["results"]
 
     if not results:
         return _tool_result(f"No results found{_scope_note(allowed)}.", is_error=True)
@@ -301,13 +320,24 @@ def _search_knowledge_base(query: str, n_results: int = 5, kb_index=None) -> dic
         if len(content) > 2000:
             content = content[:2000] + "\n\n... (truncated)"
 
+        w = r.get("weights") or {}
+        breakdown = (
+            f", raw {r['raw_score']:.3f} x class {w.get('class', 1):.2f}"
+            f" x legacy {w.get('legacy', 1):.2f} x recency {w.get('recency', 1):.2f}"
+            if "raw_score" in r else ""
+        )
         output_parts.append(
-            f"--- Result {i+1} (score: {score:.3f}) ---\n"
+            f"--- Result {i+1} (score: {score:.3f}{breakdown}) ---\n"
             f"Source: {source}\n"
             f"Repo: {repo} | Path: {path}\n\n"
             f"{content}\n"
         )
 
+    if found.get("cards_suppressed"):
+        output_parts.append(
+            f"({found['cards_suppressed']} kanban cards scored above the last "
+            f"result; pass include_cards=true to see them)"
+        )
     return _tool_result("\n".join(output_parts))
 
 
@@ -491,7 +521,8 @@ _HANDLERS = {
     # `_gateway_kb_index` is the gateway-injected per-profile scope — see the
     # block above _search_knowledge_base. Unscoped callers never send it.
     "search_knowledge_base": lambda a: _search_knowledge_base(
-        a.get("query", ""), a.get("n_results", 5), a.get("_gateway_kb_index")),
+        a.get("query", ""), a.get("n_results", 5), a.get("_gateway_kb_index"),
+        a.get("include_cards", False)),
     "update_knowledge_base": lambda a: _update_knowledge_base(
         a.get("path", ""), a.get("content", ""), a.get("_gateway_kb_index")),
     "delete_knowledge_base": lambda a: _delete_knowledge_base(

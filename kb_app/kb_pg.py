@@ -244,19 +244,70 @@ def _collapse_duplicate_content(rows: list[dict[str, Any]]) -> list[dict[str, An
     return result
 
 
-def search(query: str, n_results: int = 5) -> list[dict[str, Any]]:
-    """Cosine-similarity search over embedded documents.
+def _doc_class(doc_id: str, meta: dict, cfg: dict) -> str:
+    """card | curated | code | other, from path conventions (see settings)."""
+    if doc_id.startswith("notion/kanban/"):
+        return "card"
+    if meta.get("canonical") is True:
+        return "curated"
+    if doc_id.startswith("mapped_folders/docs/"):
+        return "curated"
+    if meta.get("type") == "code-map":
+        return "code"
+    if "/skills/" in doc_id and doc_id.endswith("SKILL.md"):
+        return "curated"
+    if doc_id.split("/", 1)[0] in cfg["curated_top_dirs"]:
+        return "curated"
+    return "other"
 
-    Returns a list of dicts: {id, content, metadata, score}, plus `also_in`
-    on a row that absorbed one or more byte-identical-content duplicates
-    (retrieval-dedup card's collapse-not-drop rule, applied here as a cheap
-    safety net), where score is in [0, 1] (1 = identical). Over-fetches by
-    `_DEDUP_OVERFETCH_FACTOR` and collapses BEFORE cutting to `n_results`,
-    so a duplicate-heavy result never silently returns fewer than asked.
+
+def _weights(doc_id: str, meta: dict, cfg: dict, now: float) -> dict[str, float]:
+    cls = _doc_class(doc_id, meta, cfg)
+    w_class = cfg["curated_weight"] if cls == "curated" else 1.0
+    w_legacy = 1.0
+    if any(f"/{root.strip('/')}/" in f"/{doc_id}" for root in cfg["legacy_roots"]):
+        w_legacy = cfg["legacy_weight"]
+    w_recency = 1.0
+    ts = meta.get("modified_at")
+    if not meta.get("canonical") and cfg["recency_floor"] < 1.0:
+        age = (now - float(ts)) / 86400 if isinstance(ts, (int, float)) else cfg["default_age_days"]
+        floor = cfg["recency_floor"]
+        w_recency = floor + (1 - floor) * 0.5 ** (max(age, 0.0) / cfg["recency_half_life_days"])
+    return {"class": w_class, "legacy": w_legacy, "recency": round(w_recency, 4), "_cls": cls}
+
+
+#: pgvector's HNSW scan returns at most ef_search candidates (default 40), so
+#: a LIMIT above that silently yields fewer rows (47 of 200 measured live).
+#: Raised per query so the over-fetch pool is really that big. pgvector max 1000.
+_MAX_POOL = 1000
+
+
+def search_ranked(query: str, n_results: int = 5, include_cards: bool = False,
+                  pool: int | None = None) -> dict[str, Any]:
+    """Cosine search re-ranked by class / legacy / recency weights.
+
+    ``score = raw_score x class x legacy x recency``. Over-fetches
+    ``max(pool_min, pool_factor x n_results)`` candidates (or ``pool``),
+    re-ranks, collapses byte-identical duplicates, then cuts to ``n_results``.
+    Kanban cards are dropped unless ``include_cards``.
+
+    Returns ``{"results": [...], "cards_suppressed": int}``; each result is
+    ``{id, content, metadata, score, raw_score, weights}`` (+ ``also_in``).
+    ``cards_suppressed`` counts dropped cards that would have outscored the
+    last returned result. Errors yield an empty result set.
     """
+    from .settings import get_ranking
+
+    empty = {"results": [], "cards_suppressed": 0}
     try:
+        cfg = get_ranking()
+        limit = pool or max(int(cfg["pool_min"]), int(cfg["pool_factor"]) * n_results,
+                            n_results * _DEDUP_OVERFETCH_FACTOR)
+        limit = min(limit, _MAX_POOL)
         vs = _vec_str(_embed_query(query))
-        rows = _get_conn().execute(
+        conn = _get_conn()
+        conn.execute("SET hnsw.ef_search = %d" % min(_MAX_POOL, max(200, limit * 2)))
+        rows = conn.execute(
             """
             SELECT id, content, metadata,
                    1 - (embedding <=> %s::vector) AS score
@@ -264,22 +315,53 @@ def search(query: str, n_results: int = 5) -> list[dict[str, Any]]:
             ORDER  BY embedding <=> %s::vector
             LIMIT  %s
             """,
-            (vs, vs, n_results * _DEDUP_OVERFETCH_FACTOR),
+            (vs, vs, limit),
         ).fetchall()
-        raw = [
-            {
-                "id": r[0],
-                "content": r[1],
-                "metadata": r[2] or {},
-                "score": float(r[3]),
+        conn.commit()
+        now = time.time()
+        ranked, cards = [], []
+        for r in rows:
+            meta = r[2] or {}
+            w = _weights(r[0], meta, cfg, now)
+            cls = w.pop("_cls")
+            raw = float(r[3])
+            row = {
+                "id": r[0], "content": r[1], "metadata": meta,
+                "score": raw * w["class"] * w["legacy"] * w["recency"],
+                "raw_score": raw, "weights": w,
             }
-            for r in rows
-        ]
-        return _collapse_duplicate_content(raw)[:n_results]
+            (cards if cls == "card" else ranked).append(row)
+        if include_cards:
+            ranked += cards
+            cards = []
+        results = _collapse_duplicate_content(ranked)[:n_results]
+        floor = min((x["score"] for x in results), default=0.0)
+        suppressed = sum(1 for c in cards if c["score"] > floor) if len(results) >= n_results else len(cards)
+        return {"results": results, "cards_suppressed": suppressed}
     except Exception as exc:
         _log.error("kb_pg: search error: %s", exc)
         _reset_conn()
-        return []
+        return empty
+
+
+def search(query: str, n_results: int = 5, include_cards: bool = False,
+           pool: int | None = None) -> list[dict[str, Any]]:
+    """List-returning wrapper over :func:`search_ranked` (all callers but the
+    MCP tool, which also wants the suppressed-cards count)."""
+    return search_ranked(query, n_results, include_cards, pool)["results"]
+
+
+def update_metadata_many(items: list[tuple[str, dict]]) -> int:
+    """Metadata-only update (no embedding): ``(doc_id, metadata)`` pairs.
+    Used by the meta_v backfill so unchanged docs pick up new ranking keys."""
+    if not items:
+        return 0
+    conn = _get_conn()
+    for doc_id, metadata in items:
+        conn.execute("UPDATE documents SET metadata = %s::jsonb WHERE id = %s",
+                     (json.dumps(metadata), doc_id))
+    conn.commit()
+    return len(items)
 
 
 def _clean_text(content: str) -> str:

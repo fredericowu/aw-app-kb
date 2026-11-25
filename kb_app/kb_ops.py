@@ -89,7 +89,9 @@ def _parse_frontmatter(text):
             if v.lower() == "false":
                 v = False
             elif v.lower() == "true":
-                v = "unknown"
+                # "unknown" is the legacy marker for edited: true; a canonical
+                # flag must read back as a real True (ranking exempts it).
+                v = True if k.strip() == "canonical" else "unknown"
             meta[k.strip()] = v
     return meta, parts[2].strip()
 
@@ -100,6 +102,8 @@ def _write_kb_file(path, meta, content):
     for k, v in meta.items():
         if v is False:
             lines.append(f"{k}: false")
+        elif v is True:
+            lines.append(f"{k}: true")
         else:
             lines.append(f"{k}: {v}")
     lines.append("---")
@@ -107,6 +111,46 @@ def _write_kb_file(path, meta, content):
     lines.append(content)
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
+
+
+#: Bump to force a metadata-only refresh of every indexed row (no re-embed).
+META_V = 2
+
+
+def _to_epoch(value):
+    """Epoch seconds from a number or an ISO-8601 string; None if unparseable."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _ranking_meta(meta, fpath):
+    """Ranking keys for the index row: type, status_key, modified_at,
+    canonical, meta_v. modified_at prefers the front matter (`modified` =
+    git last-commit time of a mapped source, `last_edited` on Notion cards)
+    and falls back to the KB file's mtime."""
+    ts = _to_epoch(meta.get("modified")) or _to_epoch(meta.get("last_edited"))
+    if ts is None:
+        try:
+            ts = os.path.getmtime(fpath)
+        except OSError:
+            ts = None
+    return {
+        "type": meta.get("type", ""),
+        "status_key": meta.get("status_key", ""),
+        "modified_at": ts,
+        "canonical": meta.get("canonical") is True,
+        "meta_v": META_V,
+    }
 
 
 def _build(force=False):
@@ -125,6 +169,8 @@ def _build(force=False):
 
     existing = _kb.get_all_metadata()  # {doc_id: metadata_dict}
 
+    meta_only = []
+    meta_refreshed = 0
     added = 0
     updated = 0
     unchanged = 0
@@ -182,17 +228,26 @@ def _build(force=False):
             checksum = meta.get("checksum", "")
             seen_ids.add(doc_id)
 
-            ex = existing.get(doc_id)
-            if ex and ex.get("checksum") == checksum:
-                unchanged += 1
-                continue
-
             metadata = {
                 "source": meta.get("source", ""),
                 "repo": repo,
                 "path": path,
                 "checksum": checksum,
+                **_ranking_meta(meta, fpath),
             }
+
+            ex = existing.get(doc_id)
+            if ex and ex.get("checksum") == checksum:
+                if ex.get("meta_v") != META_V:
+                    # Unchanged content, stale ranking metadata: refresh the
+                    # JSONB only, never re-embed.
+                    meta_only.append((doc_id, metadata))
+                    if len(meta_only) >= 500:
+                        meta_refreshed += _kb.update_metadata_many(meta_only)
+                        meta_only.clear()
+                unchanged += 1
+                continue
+
             batch.append((doc_id, content, metadata))
 
             if doc_id in existing:
@@ -204,6 +259,9 @@ def _build(force=False):
                 _flush_batch()
 
     _flush_batch()
+    meta_refreshed += _kb.update_metadata_many(meta_only)
+    if meta_refreshed:
+        print(f"  Ranking metadata refreshed (no re-embed): {meta_refreshed}")
 
     stale = set(existing.keys()) - seen_ids
     if stale:
@@ -1129,6 +1187,8 @@ def _map_repo(target, force=False):
     if extra_skips:
         print(f"  Self-map skips: {', '.join(sorted(extra_skips))}")
 
+    git_times = _git_last_commit_times(repo_dir)
+
     for root, dirs, files in os.walk(repo_dir):
         # Compute effective skip set per-directory: HTML files require the
         # stricter set, so we keep dirs that EITHER walk could traverse and
@@ -1186,7 +1246,9 @@ def _map_repo(target, force=False):
                     if meta.get("edited") and meta.get("edited") is not False:
                         total_skipped += 1
                         continue
-                    if meta.get("checksum") == f"sha256:{checksum}":
+                    # A file written before `modified` existed is rewritten
+                    # (same content) so it gains the date the ranking reads.
+                    if meta.get("checksum") == f"sha256:{checksum}" and meta.get("modified"):
                         total_skipped += 1
                         continue
                 except Exception:
@@ -1238,6 +1300,8 @@ def _map_repo(target, force=False):
                 "type": doc_type,
                 "checksum": f"sha256:{checksum}",
                 "edited": False,
+                "modified": git_times.get(rel_path.replace(os.sep, "/"))
+                            or int(os.path.getmtime(src_path)),
             }
             _write_kb_file(out_path, meta, content)
 
@@ -1252,6 +1316,32 @@ def _map_repo(target, force=False):
     if total_pruned:
         print(f"  {total_pruned} stale output file(s) removed (source no longer exists)")
     print(f"  Output: {out_dir}")
+
+
+def _git_last_commit_times(repo_dir):
+    """{path relative to repo_dir: last-commit epoch}, one `git log` pass.
+    Empty when repo_dir is not inside a git checkout or git fails; callers
+    then fall back to the source file's mtime."""
+    import subprocess
+    try:
+        top = subprocess.run(["git", "-C", repo_dir, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        if not top:
+            return {}
+        out = subprocess.run(["git", "-C", top, "log", "--format=@%ct", "--name-only"],
+                             capture_output=True, text=True, errors="replace",
+                             timeout=600).stdout
+    except Exception:
+        return {}
+    prefix = os.path.relpath(repo_dir, top)
+    prefix = "" if prefix == "." else prefix + "/"
+    times, ts = {}, None
+    for line in out.splitlines():  # newest commit first: first sighting wins
+        if line.startswith("@"):
+            ts = int(line[1:])
+        elif line and ts is not None and line.startswith(prefix):
+            times.setdefault(line[len(prefix):], ts)
+    return times
 
 
 def _prune_stale_mapped_files(out_dir, seen_outputs, total_eligible):

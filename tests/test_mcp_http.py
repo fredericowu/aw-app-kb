@@ -102,7 +102,7 @@ def _doc(repo, path, content="body"):
 def _fake_index(monkeypatch, docs):
     from kb_app import kb_pg
     monkeypatch.setattr(kb_pg, "count", lambda: len(docs))
-    monkeypatch.setattr(kb_pg, "search", lambda q, n_results=5: docs[:n_results])
+    monkeypatch.setattr(kb_pg, "search_ranked", lambda q, n_results=5, include_cards=False, pool=None: {"results": docs[:n_results], "cards_suppressed": 0})
 
 
 def test_scoped_search_returns_only_the_allowed_repo(monkeypatch):
@@ -331,7 +331,7 @@ def test_search_knowledge_base_never_calls_exec_pg(monkeypatch):
     from kb_app import exec_pg, kb_pg
 
     monkeypatch.setattr(kb_pg, "count", lambda: 3)
-    monkeypatch.setattr(kb_pg, "search", lambda q, n_results=5: [_doc("docs", "a.md", "plain doc content")])
+    monkeypatch.setattr(kb_pg, "search_ranked", lambda q, n_results=5, include_cards=False, pool=None: {"results": [_doc("docs", "a.md", "plain doc content")], "cards_suppressed": 0})
 
     def _must_not_be_called(*a, **k):
         raise AssertionError("search_knowledge_base must never touch exec_pg")
@@ -355,7 +355,13 @@ def test_search_execution_history_never_calls_kb_pg_search(monkeypatch):
     def _must_not_be_called(*a, **k):
         raise AssertionError("search_execution_history must never touch kb_pg.search")
 
-    monkeypatch.setattr(kb_pg, "search", _must_not_be_called)
+    monkeypatch.setattr(kb_pg, "search_ranked", _must_not_be_called)
 
     result = _call("search_execution_history", {"query": "anything"})
     assert result["isError"] is False
+
+
+def test_search_tool_schema_advertises_include_cards():
+    tool = next(t for t in mcp_http.TOOLS_SCHEMA if t["name"] == "search_knowledge_base")
+    assert tool["inputSchema"]["properties"]["include_cards"]["type"] == "boolean"
+    assert "include_cards" in tool["description"]

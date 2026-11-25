@@ -97,6 +97,11 @@ class _FakeKB:
     def upsert(self, doc_id, content, metadata):
         self.upserted.append((doc_id, content, metadata))
 
+    def update_metadata_many(self, items):
+        self.meta_updated = getattr(self, "meta_updated", [])
+        self.meta_updated.extend(items)
+        return len(items)
+
     def delete_many(self, ids):
         self.deleted_ids.extend(ids)
         return len(ids)
@@ -975,3 +980,58 @@ def test_run_dispatches_search(monkeypatch):
     monkeypatch.setattr(kb_ops, "_search", lambda q, top_k: calls.append((q, top_k)))
     kb_ops.run(["--search", "my query", "--top-k", "7"])
     assert calls == [("my query", 7)]
+
+
+# ---------------------------------------------------------------------------
+# Ranking metadata (card 4235bf3b)
+# ---------------------------------------------------------------------------
+
+def test_canonical_true_reads_back_as_a_real_true():
+    meta, _ = kb_ops._parse_frontmatter("---\ncanonical: true\nedited: true\n---\nbody")
+    assert meta["canonical"] is True
+    assert meta["edited"] == "unknown"  # legacy marker unchanged
+
+
+def test_ranking_meta_prefers_frontmatter_dates_then_mtime(tmp_path):
+    f = tmp_path / "a.md"
+    f.write_text("x")
+    m = kb_ops._ranking_meta({"modified": "1700000000", "type": "doc"}, str(f))
+    assert m["modified_at"] == 1700000000.0 and m["meta_v"] == kb_ops.META_V
+    m = kb_ops._ranking_meta({"last_edited": "2026-10-24T09:47:00.000Z", "status_key": "done"}, str(f))
+    assert m["modified_at"] > 1.7e9 and m["status_key"] == "done"
+    m = kb_ops._ranking_meta({}, str(f))  # no git date: mtime fallback
+    assert m["modified_at"] == pytest.approx(f.stat().st_mtime)
+    assert m["canonical"] is False
+
+
+def test_build_refreshes_metadata_only_when_meta_v_is_stale(kb_dir, monkeypatch):
+    (kb_dir / "same.md").write_text("---\nchecksum: sha256:xyz\ncanonical: true\n---\nunchanged body")
+    fake = _FakeKB(existing={"same.md": {"checksum": "sha256:xyz"}})
+    monkeypatch.setattr(kb_ops, "_kb", fake)
+
+    kb_ops._build(force=False)
+
+    assert fake.upserted == [], "no re-embedding"
+    (doc_id, md), = fake.meta_updated
+    assert doc_id == "same.md" and md["meta_v"] == kb_ops.META_V and md["canonical"] is True
+
+
+def test_build_leaves_current_meta_v_rows_alone(kb_dir, monkeypatch):
+    (kb_dir / "same.md").write_text("---\nchecksum: sha256:xyz\n---\nunchanged body")
+    fake = _FakeKB(existing={"same.md": {"checksum": "sha256:xyz", "meta_v": kb_ops.META_V}})
+    monkeypatch.setattr(kb_ops, "_kb", fake)
+    kb_ops._build(force=False)
+    assert fake.upserted == [] and not getattr(fake, "meta_updated", [])
+
+
+def test_git_last_commit_times_reads_one_log_pass(tmp_path):
+    import subprocess
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z",
+           "GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "PATH": os.environ["PATH"]}
+    (tmp_path / "a.md").write_text("hello")
+    for cmd in (["init", "-q"], ["add", "."], ["commit", "-qm", "x"]):
+        subprocess.run(["git", "-C", str(tmp_path)] + cmd, check=True, env=env)
+    times = kb_ops._git_last_commit_times(str(tmp_path))
+    assert times["a.md"] == 1704067200
+    assert kb_ops._git_last_commit_times(str(tmp_path / "nope")) == {}

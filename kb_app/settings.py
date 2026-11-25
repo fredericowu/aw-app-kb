@@ -50,3 +50,31 @@ def save_settings(data: dict) -> dict:
     with open(SETTINGS_PATH, "w") as f:
         json.dump(current, f, indent=2)
     return current
+
+
+#: Query-time ranking weights (card 4235bf3b). Applied at SEARCH time over the
+#: over-fetched candidate pool, so retuning is a settings.json edit under the
+#: ``ranking`` key, never a reindex. ``recency_floor`` 1.0 switches recency off.
+DEFAULT_RANKING = {
+    "curated_weight": 1.05,
+    "legacy_weight": 0.85,
+    # A doc id containing "/<root>/" is a copy of a deactivated codebase.
+    "legacy_roots": ["repos/agentic-workspace"],
+    # Top-level KB folders whose docs are curated, hand-written knowledge.
+    "curated_top_dirs": ["docs", "skills", "memory", "apps"],
+    "recency_floor": 0.85,
+    "recency_half_life_days": 180,
+    # Age assumed for a doc with no modified_at (unbackfilled row).
+    "default_age_days": 30,
+    "pool_min": 60,
+    "pool_factor": 12,
+}
+
+
+def get_ranking() -> dict:
+    """Defaults overlaid with the optional ``ranking`` dict in settings.json."""
+    out = dict(DEFAULT_RANKING)
+    override = get_settings().get("ranking")
+    if isinstance(override, dict):
+        out.update({k: v for k, v in override.items() if k in DEFAULT_RANKING})
+    return out

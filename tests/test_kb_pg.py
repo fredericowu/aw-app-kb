@@ -7,6 +7,8 @@ needs a real Postgres.
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from kb_app import kb_pg
@@ -42,6 +44,8 @@ class _FakeConn:
 
     def execute(self, sql, params=()):
         self.executed.append((sql, params))
+        if sql.startswith("SET "):  # hnsw.ef_search, not a queued query
+            return _FakeCursor()
         if self._queue:
             return self._queue.pop(0)
         return _FakeCursor()
@@ -114,41 +118,89 @@ def test_count_swallows_db_errors_and_resets(monkeypatch, fake_conn):
 # search
 # ---------------------------------------------------------------------------
 
+def _row(i, content, score, meta=None):
+    return (i, content, meta if meta is not None else {}, score)
+
+
 def test_search_returns_id_content_metadata_score(fake_conn):
-    fake_conn.queue_result(rows=[("doc-1", "hello", {"repo": "x"}, 0.87)])
-    results = kb_pg.search("query")
-    assert results == [{"id": "doc-1", "content": "hello", "metadata": {"repo": "x"}, "score": 0.87}]
+    fake_conn.queue_result(rows=[_row("doc-1", "hello", 0.87, {"repo": "x"})])
+    r = kb_pg.search("query", include_cards=False)[0]
+    assert (r["id"], r["content"], r["metadata"]["repo"], r["raw_score"]) == ("doc-1", "hello", "x", 0.87)
 
 
 def test_search_defaults_metadata_to_empty_dict_when_null(fake_conn):
     fake_conn.queue_result(rows=[("doc-1", "hello", None, 0.5)])
-    results = kb_pg.search("query")
-    assert results[0]["metadata"] == {}
+    assert kb_pg.search("query")[0]["metadata"] == {}
 
 
-def test_search_passes_an_overfetched_limit_not_n_results(fake_conn):
-    # retrieval-dedup card: the SQL LIMIT is the over-fetch window the
-    # content-dedup collapse runs on, not `n_results` itself — the cut to
-    # `n_results` happens in Python, after collapsing.
+def test_search_pool_is_at_least_60_and_raises_ef_search(fake_conn):
     kb_pg.search("query", n_results=3)
-    sql, params = fake_conn.executed[0]
-    assert params[-1] == 3 * kb_pg._DEDUP_OVERFETCH_FACTOR
+    ef = [sql for sql, _ in fake_conn.executed if sql.startswith("SET hnsw.ef_search")]
+    assert ef, "ef_search must be raised or HNSW caps the pool far below LIMIT"
+    assert int(ef[0].split("=")[1]) >= 120
+    assert fake_conn.executed[-1][1][-1] == 60
+    kb_pg.search("query", n_results=10)
+    assert fake_conn.executed[-1][1][-1] == 120  # 12 x n_results
 
 
 def test_search_collapses_byte_identical_content_onto_the_highest_score(fake_conn):
-    fake_conn.queue_result(
-        rows=[
-            ("doc-a", "shared text", {}, 0.80),
-            ("doc-b", "shared text", {}, 0.90),
-            ("doc-c", "distinct text", {}, 0.70),
-        ]
-    )
+    fake_conn.queue_result(rows=[
+        _row("doc-a", "shared text", 0.80), _row("doc-b", "shared text", 0.90),
+        _row("doc-c", "distinct text", 0.70)])
     results = kb_pg.search("query", n_results=2)
-    assert len(results) == 2
-    assert results[0]["id"] == "doc-b", "highest-scoring duplicate must survive"
-    assert results[0]["also_in"] == [{"id": "doc-a", "score": 0.80}]
-    assert results[1]["id"] == "doc-c"
-    assert "also_in" not in results[1], "a row nothing collapsed onto must be unchanged"
+    assert [r["id"] for r in results] == ["doc-b", "doc-c"]
+    assert results[0]["also_in"][0]["id"] == "doc-a"
+    assert "also_in" not in results[1]
+
+
+def test_cards_excluded_by_default_and_counted(fake_conn):
+    rows = [_row("notion/kanban/c1.md", "card", 0.90), _row("docs/a.md", "a", 0.80)]
+    fake_conn.queue_result(rows=rows)
+    out = kb_pg.search_ranked("q", n_results=1)
+    assert [r["id"] for r in out["results"]] == ["docs/a.md"]
+    assert out["cards_suppressed"] == 1
+
+
+def test_include_cards_returns_them_at_full_score(fake_conn):
+    fake_conn.queue_result(rows=[_row("notion/kanban/c1.md", "card", 0.90, {"modified_at": time.time()}),
+                                 _row("other/a.md", "a", 0.80)])
+    out = kb_pg.search_ranked("q", n_results=2, include_cards=True)
+    assert out["results"][0]["id"] == "notion/kanban/c1.md"
+    assert out["results"][0]["weights"]["class"] == 1.0
+    assert out["cards_suppressed"] == 0
+
+
+def test_weights_multiply_to_score_and_curated_beats_legacy(fake_conn):
+    fresh = {"modified_at": time.time()}
+    fake_conn.queue_result(rows=[
+        _row("mapped_folders/repos/agentic-workspace/x.md", "legacy", 0.80, fresh),
+        _row("mapped_folders/docs/runbook.md", "curated", 0.78, fresh)])
+    res = kb_pg.search("q", n_results=2)
+    assert [r["id"] for r in res] == ["mapped_folders/docs/runbook.md",
+                                      "mapped_folders/repos/agentic-workspace/x.md"]
+    for r in res:
+        w = r["weights"]
+        assert r["score"] == pytest.approx(r["raw_score"] * w["class"] * w["legacy"] * w["recency"])
+    assert res[0]["weights"]["class"] == 1.05
+    assert res[1]["weights"]["legacy"] == 0.85
+
+
+def test_recency_decays_but_canonical_is_exempt(fake_conn):
+    old = {"modified_at": time.time() - 180 * 86400}
+    fake_conn.queue_result(rows=[
+        _row("a/old.md", "x", 0.8, old),
+        _row("a/canon.md", "y", 0.8, dict(old, canonical=True)),
+        _row("a/new.md", "z", 0.8, {"modified_at": time.time()})])
+    res = {r["id"]: r["weights"]["recency"] for r in kb_pg.search("q", n_results=3)}
+    assert res["a/old.md"] == pytest.approx(0.925, abs=0.002)  # 0.85 + 0.15 * 0.5
+    assert res["a/canon.md"] == 1.0
+    assert res["a/new.md"] == pytest.approx(1.0, abs=0.001)
+
+
+def test_update_metadata_many_never_embeds(fake_conn, monkeypatch):
+    monkeypatch.setattr(kb_pg, "_embed_docs", lambda t: (_ for _ in ()).throw(AssertionError("embedded")))
+    assert kb_pg.update_metadata_many([("d", {"meta_v": 2})]) == 1
+    assert "embedding" not in fake_conn.executed[-1][0]
 
 
 def test_search_swallows_errors_and_resets(monkeypatch, fake_conn):

@@ -197,6 +197,16 @@ def test_recency_decays_but_canonical_is_exempt(fake_conn):
     assert res["a/new.md"] == pytest.approx(1.0, abs=0.001)
 
 
+def test_pool_widens_when_cards_fill_it(fake_conn):
+    cards = [_row(f"notion/kanban/c{i}.md", "c%d" % i, 0.9) for i in range(60)]
+    fake_conn.queue_result(rows=cards)
+    fake_conn.queue_result(rows=cards + [_row("docs/a.md", "doc", 0.8)])
+    out = kb_pg.search_ranked("q", n_results=1)
+    assert [r["id"] for r in out["results"]] == ["docs/a.md"]
+    limits = [p[-1] for sql, p in fake_conn.executed if "LIMIT" in sql]
+    assert limits == [60, 240]
+
+
 def test_update_metadata_many_never_embeds(fake_conn, monkeypatch):
     monkeypatch.setattr(kb_pg, "_embed_docs", lambda t: (_ for _ in ()).throw(AssertionError("embedded")))
     assert kb_pg.update_metadata_many([("d", {"meta_v": 2})]) == 1

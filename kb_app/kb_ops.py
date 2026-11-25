@@ -238,8 +238,9 @@ def _build(force=False):
 
             ex = existing.get(doc_id)
             if ex and ex.get("checksum") == checksum:
-                if ex.get("meta_v") != META_V:
-                    # Unchanged content, stale ranking metadata: refresh the
+                if any(ex.get(k) != v for k, v in metadata.items()):
+                    # Unchanged content, stale ranking metadata (meta_v bump, or a
+                    # status/last_edited/canonical edit with the same body): refresh the
                     # JSONB only, never re-embed.
                     meta_only.append((doc_id, metadata))
                     if len(meta_only) >= 500:
@@ -1328,19 +1329,26 @@ def _git_last_commit_times(repo_dir):
                              capture_output=True, text=True, timeout=30).stdout.strip()
         if not top:
             return {}
-        out = subprocess.run(["git", "-C", top, "log", "--format=@%ct", "--name-only"],
+        out = subprocess.run(["git", "-C", top, "log", "-z", "--format=%x01%ct%x02", "--name-only"],
                              capture_output=True, text=True, errors="replace",
                              timeout=600).stdout
     except Exception:
         return {}
     prefix = os.path.relpath(repo_dir, top)
     prefix = "" if prefix == "." else prefix + "/"
-    times, ts = {}, None
-    for line in out.splitlines():  # newest commit first: first sighting wins
-        if line.startswith("@"):
-            ts = int(line[1:])
-        elif line and ts is not None and line.startswith(prefix):
-            times.setdefault(line[len(prefix):], ts)
+    times = {}
+    # \x01<ts>\x02 marks a commit; -z NUL-delimits paths, so a filename that
+    # starts with "@" (or anything else) can never be read as a timestamp.
+    for chunk in out.split("\x01")[1:]:  # newest commit first: first sighting wins
+        head, _, names = chunk.partition("\x02")
+        try:
+            ts = int(head)
+        except ValueError:
+            continue
+        for name in names.split("\0"):
+            name = name.strip("\n")
+            if name and name.startswith(prefix):
+                times.setdefault(name[len(prefix):], ts)
     return times
 
 

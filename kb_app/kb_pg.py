@@ -306,31 +306,38 @@ def search_ranked(query: str, n_results: int = 5, include_cards: bool = False,
         limit = min(limit, _MAX_POOL)
         vs = _vec_str(_embed_query(query))
         conn = _get_conn()
-        conn.execute("SET hnsw.ef_search = %d" % min(_MAX_POOL, max(200, limit * 2)))
-        rows = conn.execute(
-            """
-            SELECT id, content, metadata,
-                   1 - (embedding <=> %s::vector) AS score
-            FROM   documents
-            ORDER  BY embedding <=> %s::vector
-            LIMIT  %s
-            """,
-            (vs, vs, limit),
-        ).fetchall()
-        conn.commit()
         now = time.time()
-        ranked, cards = [], []
-        for r in rows:
-            meta = r[2] or {}
-            w = _weights(r[0], meta, cfg, now)
-            cls = w.pop("_cls")
-            raw = float(r[3])
-            row = {
-                "id": r[0], "content": r[1], "metadata": meta,
-                "score": raw * w["class"] * w["legacy"] * w["recency"],
-                "raw_score": raw, "weights": w,
-            }
-            (cards if cls == "card" else ranked).append(row)
+        while True:
+            conn.execute("SET hnsw.ef_search = %d" % min(_MAX_POOL, max(200, limit * 2)))
+            rows = conn.execute(
+                """
+                SELECT id, content, metadata,
+                       1 - (embedding <=> %s::vector) AS score
+                FROM   documents
+                ORDER  BY embedding <=> %s::vector
+                LIMIT  %s
+                """,
+                (vs, vs, limit),
+            ).fetchall()
+            conn.commit()
+            ranked, cards = [], []
+            for r in rows:
+                meta = r[2] or {}
+                w = _weights(r[0], meta, cfg, now)
+                cls = w.pop("_cls")
+                raw = float(r[3])
+                row = {
+                    "id": r[0], "content": r[1], "metadata": meta,
+                    "score": raw * w["class"] * w["legacy"] * w["recency"],
+                    "raw_score": raw, "weights": w,
+                }
+                (cards if cls == "card" else ranked).append(row)
+            # Excluded cards can eat the whole pool: widen the scan until
+            # enough non-card candidates exist or the index is exhausted.
+            if (include_cards or len(ranked) >= n_results or len(rows) < limit
+                    or limit >= _MAX_POOL):
+                break
+            limit = min(limit * 4, _MAX_POOL)
         if include_cards:
             ranked += cards
             cards = []

@@ -362,7 +362,8 @@ class KnowledgeBaseRoutes:
             total = kb_pg.count()
             if total == 0:
                 return []
-            results = kb_pg.search(q, n_results=min(n, total))
+            # The UI has no include_cards toggle: keep cards searchable here.
+            results = kb_pg.search(q, n_results=min(n, total), include_cards=True)
             items = []
             for r in results:
                 items.append({

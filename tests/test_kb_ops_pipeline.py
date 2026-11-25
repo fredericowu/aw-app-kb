@@ -1018,7 +1018,9 @@ def test_build_refreshes_metadata_only_when_meta_v_is_stale(kb_dir, monkeypatch)
 
 def test_build_leaves_current_meta_v_rows_alone(kb_dir, monkeypatch):
     (kb_dir / "same.md").write_text("---\nchecksum: sha256:xyz\n---\nunchanged body")
-    fake = _FakeKB(existing={"same.md": {"checksum": "sha256:xyz", "meta_v": kb_ops.META_V}})
+    current = {"source": "", "repo": "same.md", "path": "same.md", "checksum": "sha256:xyz",
+               **kb_ops._ranking_meta({"checksum": "sha256:xyz"}, str(kb_dir / "same.md"))}
+    fake = _FakeKB(existing={"same.md": current})
     monkeypatch.setattr(kb_ops, "_kb", fake)
     kb_ops._build(force=False)
     assert fake.upserted == [] and not getattr(fake, "meta_updated", [])
@@ -1030,8 +1032,21 @@ def test_git_last_commit_times_reads_one_log_pass(tmp_path):
            "GIT_COMMITTER_EMAIL": "t@t", "GIT_COMMITTER_DATE": "2024-01-01T00:00:00Z",
            "GIT_AUTHOR_DATE": "2024-01-01T00:00:00Z", "PATH": os.environ["PATH"]}
     (tmp_path / "a.md").write_text("hello")
+    (tmp_path / "@overview.md").write_text("at")
     for cmd in (["init", "-q"], ["add", "."], ["commit", "-qm", "x"]):
         subprocess.run(["git", "-C", str(tmp_path)] + cmd, check=True, env=env)
     times = kb_ops._git_last_commit_times(str(tmp_path))
     assert times["a.md"] == 1704067200
+    assert times["@overview.md"] == 1704067200
     assert kb_ops._git_last_commit_times(str(tmp_path / "nope")) == {}
+
+
+def test_build_refreshes_metadata_when_values_change_at_current_meta_v(kb_dir, monkeypatch):
+    (kb_dir / "c.md").write_text("---\nchecksum: sha256:xyz\nstatus_key: done\n---\nbody")
+    old = {"checksum": "sha256:xyz", "meta_v": kb_ops.META_V, "status_key": "open", "type": "",
+           "canonical": False}
+    fake = _FakeKB(existing={"c.md": old})
+    monkeypatch.setattr(kb_ops, "_kb", fake)
+    kb_ops._build(force=False)
+    assert fake.upserted == []
+    assert fake.meta_updated[0][1]["status_key"] == "done"
